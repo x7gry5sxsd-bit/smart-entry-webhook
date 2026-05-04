@@ -1,6 +1,6 @@
 """
 SMART ENTRY MEMS — Webhook сервис обогащения сигналов
-Версия 2: Фиксированный формат ответа.
+Версия 2.1: Строгий regex для CA (только pump.fun токены).
 """
 
 import re
@@ -15,17 +15,17 @@ log = logging.getLogger(__name__)
 
 app = FastAPI(title="SMART ENTRY Webhook")
 
-CA_REGEX = re.compile(r'\b([1-9A-HJ-NP-Za-km-z]{32,44})\b')
+# Строгий regex: 32-40 символов base58 + обязательно "pump" в конце
+CA_REGEX = re.compile(r'\b([1-9A-HJ-NP-Za-km-z]{32,40}pump)\b')
 
 
 def extract_ca(text):
     if not text:
         return None
     matches = CA_REGEX.findall(text)
-    candidates = [m for m in matches if 40 <= len(m) <= 44]
-    if not candidates:
+    if not matches:
         return None
-    return max(candidates, key=len)
+    return max(matches, key=len)
 
 
 async def fetch_rugcheck(client, ca):
@@ -183,7 +183,7 @@ async def enrich(request: Request):
 
 @app.get("/")
 async def root():
-    return {"service": "SMART ENTRY Webhook", "status": "ok", "version": "2"}
+    return {"service": "SMART ENTRY Webhook", "status": "ok", "version": "2.1"}
 
 
 @app.get("/health")
