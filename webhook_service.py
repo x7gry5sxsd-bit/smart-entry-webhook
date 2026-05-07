@@ -1,19 +1,14 @@
-“””
-Webhook Service v2.3 - Smart Entry MEMS
-Обогащает Phanes сигналы данными от RugCheck и DexScreener.
+# Webhook Service v2.3 - Smart Entry MEMS
 
-Новое в v2.3:
+# Author: Uspex
 
-- LIQUIDITY_USD - реальная ликвидность в долларах с DexScreener
-- PRICE_1H - изменение цены за 1 час
-- TXNS_5M_TOTAL - общее число транзакций за 5 минут (BUYS+SELLS)
-- Сохранены все поля из v2.2
+# Version 2.3 - added LIQUIDITY_USD, PRICE_1H, TXNS_5M_TOTAL
 
-Deployment: Render Free Tier
-URL: https://smart-entry-webhook.onrender.com/enrich
-Endpoint: POST /enrich
-Health: GET /health (для cron-job.org каждые 10 минут)
-“””
+# Deployed on Render Free Tier
+
+# URL: https://smart-entry-webhook.onrender.com/enrich
+
+# Health endpoint: /health (for cron-job.org keepalive)
 
 import re
 import os
@@ -22,11 +17,11 @@ import requests
 
 app = Flask(**name**)
 
-# Regex - все Solana CA (включая не-pump токены)
+# Regex - matches all Solana CA addresses (32-44 chars, base58)
 
 SOLANA_CA_PATTERN = re.compile(r’\b([1-9A-HJ-NP-Za-km-z]{32,44})\b’)
 
-# Слова которые не являются адресами
+# Words that look like CA but are not addresses
 
 EXCLUDE_WORDS = {
 ‘PFM’, ‘TIP’, ‘OKX’, ‘MAE’, ‘BAN’, ‘BNK’, ‘PDR’, ‘BLO’, ‘STB’,
@@ -34,28 +29,28 @@ EXCLUDE_WORDS = {
 ‘NEW’, ‘live’, ‘meme’, ‘docs’, ‘guide’, ‘matches’
 }
 
-DEXSCREENER_URL = “https://api.dexscreener.com/latest/dex/tokens/{ca}”
-RUGCHECK_URL = “https://api.rugcheck.xyz/v1/tokens/{ca}/report/summary”
+DEXSCREENER_URL = ‘https://api.dexscreener.com/latest/dex/tokens/{ca}’
+RUGCHECK_URL = ‘https://api.rugcheck.xyz/v1/tokens/{ca}/report/summary’
 
 @app.route(’/health’, methods=[‘GET’, ‘HEAD’])
 def health():
-“”“Health check для cron-job.org keepalive”””
-return jsonify({“status”: “ok”, “version”: “2.3”}), 200
+# Health check for cron-job.org keepalive
+return jsonify({‘status’: ‘ok’, ‘version’: ‘2.3’}), 200
 
 @app.route(’/enrich’, methods=[‘POST’])
 def enrich():
-“”“Основной endpoint - обогащение сигнала”””
+# Main endpoint - signal enrichment
 try:
 data = request.get_json()
 if not data or ‘message’ not in data:
-return jsonify({“error”: “no message”}), 400
+return jsonify({‘error’: ‘no message’}), 400
 
 ```
     message = data['message']
     ca = extract_ca(message)
     
     if not ca:
-        return format_response(empty_data(), source="no_ca")
+        return format_response(empty_data(), source='no_ca')
     
     rugcheck = fetch_rugcheck(ca)
     dexscreener = fetch_dexscreener(ca)
@@ -63,17 +58,15 @@ return jsonify({“error”: “no message”}), 400
     return format_response({
         **rugcheck,
         **dexscreener
-    }, source="full")
+    }, source='full')
     
 except Exception as e:
-    return format_response(empty_data(), source=f"error: {str(e)}")
+    return format_response(empty_data(), source='error: ' + str(e))
 ```
 
 def extract_ca(message):
-“””
-Извлечь Contract Address из сообщения.
-Приоритет: pump-токены (suffix ‘pump’), затем любые Solana CA.
-“””
+# Extract Contract Address from message
+# Priority: pump tokens (suffix ‘pump’), then any Solana CA
 matches = SOLANA_CA_PATTERN.findall(message)
 
 ```
@@ -82,17 +75,17 @@ candidates = [m for m in matches if m not in EXCLUDE_WORDS]
 if not candidates:
     return None
 
-# Приоритет pump-токенам
+# Priority for pump tokens
 pump_tokens = [c for c in candidates if c.endswith('pump')]
 if pump_tokens:
     return pump_tokens[0]
 
-# Иначе первый найденный
+# Otherwise first found
 return candidates[0]
 ```
 
 def fetch_rugcheck(ca):
-“”“RugCheck API - SAFE/WARNING/DANGER + flags + LP_LOCKED”””
+# RugCheck API - SAFE/WARNING/DANGER + flags + LP_LOCKED
 try:
 r = requests.get(RUGCHECK_URL.format(ca=ca), timeout=8)
 if r.status_code != 200:
@@ -110,7 +103,7 @@ return rugcheck_fallback()
     else:
         risk_level = 'DANGER'
     
-    # Override: если в risks высокий уровень
+    # Override: high level risks force DANGER
     risks = d.get('risks', [])
     if any(r.get('level') == 'danger' for r in risks):
         risk_level = 'DANGER'
@@ -142,12 +135,12 @@ return rugcheck_fallback()
         'lp_locked': int(lp_locked) if lp_locked else 100
     }
 
-except Exception as e:
+except Exception:
     return rugcheck_fallback()
 ```
 
 def fetch_dexscreener(ca):
-“”“DexScreener API - все DEX метрики + НОВЫЕ поля v2.3”””
+# DexScreener API - all DEX metrics + NEW v2.3 fields
 try:
 r = requests.get(DEXSCREENER_URL.format(ca=ca), timeout=8)
 if r.status_code != 200:
@@ -160,7 +153,7 @@ return dexscreener_fallback()
     if not pairs:
         return {**dexscreener_fallback(), 'dex_status': 'UNAVAILABLE'}
     
-    # Берём пару с наибольшей ликвидностью (актуальный пул)
+    # Take pair with highest liquidity (most active pool)
     pair = max(pairs, key=lambda p: p.get('liquidity', {}).get('usd', 0))
     
     vol_5m = pair.get('volume', {}).get('m5', 0)
@@ -175,12 +168,10 @@ return dexscreener_fallback()
     bs_onchain = buys / sells if sells > 0 else (buys if buys > 0 else 0)
     
     price_5m = pair.get('priceChange', {}).get('m5', 0)
-    price_1h = pair.get('priceChange', {}).get('h1', 0)  # НОВОЕ
+    price_1h = pair.get('priceChange', {}).get('h1', 0)
     
-    # НОВОЕ - ликвидность в USD
+    # NEW v2.3 fields
     liquidity_usd = pair.get('liquidity', {}).get('usd', 0)
-    
-    # НОВОЕ - общее число транзакций за 5 минут
     txns_5m_total = buys + sells
     
     return {
@@ -192,26 +183,26 @@ return dexscreener_fallback()
         'buys_5m': buys,
         'sells_5m': sells,
         'price_5m': round(price_5m, 1),
-        'liquidity_usd': int(liquidity_usd),  # НОВОЕ
-        'price_1h': round(price_1h, 1),  # НОВОЕ
-        'txns_5m_total': txns_5m_total  # НОВОЕ
+        'liquidity_usd': int(liquidity_usd),
+        'price_1h': round(price_1h, 1),
+        'txns_5m_total': txns_5m_total
     }
 
-except Exception as e:
+except Exception:
     return dexscreener_fallback()
 ```
 
 def rugcheck_fallback():
-“”“Нейтральный fallback - не блокировать”””
+# Neutral fallback - do not block signal
 return {
 ‘rug_level’: ‘UNKNOWN’,
 ‘rug_score’: 0,
 ‘rug_flags’: ‘NONE’,
-‘lp_locked’: 100  # Нейтральный — не блокировать сигнал
+‘lp_locked’: 100
 }
 
 def dexscreener_fallback():
-“”“Нейтральный fallback”””
+# Neutral fallback
 return {
 ‘dex_status’: ‘UNAVAILABLE’,
 ‘vol_5m’: 0,
@@ -221,9 +212,9 @@ return {
 ‘buys_5m’: 0,
 ‘sells_5m’: 0,
 ‘price_5m’: 0,
-‘liquidity_usd’: 0,  # НОВОЕ
-‘price_1h’: 0,  # НОВОЕ
-‘txns_5m_total’: 0  # НОВОЕ
+‘liquidity_usd’: 0,
+‘price_1h’: 0,
+‘txns_5m_total’: 0
 }
 
 def empty_data():
@@ -232,28 +223,28 @@ return {
 **dexscreener_fallback()
 }
 
-def format_response(data, source=“full”):
-“”“Формат ответа для FlowIn substitution”””
-response_text = f”””=== ON-CHAIN ===
-RUG_LEVEL: {data[‘rug_level’]}
-RUG_SCORE: {data[‘rug_score’]}
-RUG_FLAGS: {data[‘rug_flags’]}
-LP_LOCKED: {data[‘lp_locked’]}
-DEX_STATUS: {data[‘dex_status’]}
-VOL_5M: {data[‘vol_5m’]}
-VOL_1H: {data[‘vol_1h’]}
-VOL_ACCEL: {data[‘vol_accel’]}
-BS_ONCHAIN: {data[‘bs_onchain’]}
-BUYS_5M: {data[‘buys_5m’]}
-SELLS_5M: {data[‘sells_5m’]}
-PRICE_5M: {data[‘price_5m’]}
-LIQUIDITY_USD: {data[‘liquidity_usd’]}
-PRICE_1H: {data[‘price_1h’]}
-TXNS_5M_TOTAL: {data[‘txns_5m_total’]}
-===============”””
+def format_response(data, source=‘full’):
+# Format response for FlowIn substitution
+response_text = ‘=== ON-CHAIN ===\n’
+response_text += ’RUG_LEVEL: ’ + str(data[‘rug_level’]) + ‘\n’
+response_text += ’RUG_SCORE: ’ + str(data[‘rug_score’]) + ‘\n’
+response_text += ’RUG_FLAGS: ’ + str(data[‘rug_flags’]) + ‘\n’
+response_text += ’LP_LOCKED: ’ + str(data[‘lp_locked’]) + ‘\n’
+response_text += ’DEX_STATUS: ’ + str(data[‘dex_status’]) + ‘\n’
+response_text += ’VOL_5M: ’ + str(data[‘vol_5m’]) + ‘\n’
+response_text += ’VOL_1H: ’ + str(data[‘vol_1h’]) + ‘\n’
+response_text += ’VOL_ACCEL: ’ + str(data[‘vol_accel’]) + ‘\n’
+response_text += ’BS_ONCHAIN: ’ + str(data[‘bs_onchain’]) + ‘\n’
+response_text += ’BUYS_5M: ’ + str(data[‘buys_5m’]) + ‘\n’
+response_text += ’SELLS_5M: ’ + str(data[‘sells_5m’]) + ‘\n’
+response_text += ’PRICE_5M: ’ + str(data[‘price_5m’]) + ‘\n’
+response_text += ’LIQUIDITY_USD: ’ + str(data[‘liquidity_usd’]) + ‘\n’
+response_text += ’PRICE_1H: ’ + str(data[‘price_1h’]) + ‘\n’
+response_text += ’TXNS_5M_TOTAL: ’ + str(data[‘txns_5m_total’]) + ‘\n’
+response_text += ‘===============’
 
 ```
-return jsonify({"response": response_text, "source": source}), 200
+return jsonify({'response': response_text, 'source': source}), 200
 ```
 
 if **name** == ‘**main**’:
