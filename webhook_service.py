@@ -1,224 +1,215 @@
-# Webhook Service v2.3 - Smart Entry MEMS
-# ASCII-clean version
-# Deployed on Render Free Tier
-# URL: https://smart-entry-webhook.onrender.com/enrich
-# Health endpoint: /health for cron-job.org keepalive
-
 import re
-import os
+import asyncio
 import logging
-from flask import Flask, request, jsonify
-import requests
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+import httpx
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+log = logging.getLogger(**name**)
 
-app = Flask(__name__)
+app = FastAPI(title=‘SMART ENTRY Webhook’)
 
-SOLANA_CA_PATTERN = re.compile(r'\b([1-9A-HJ-NP-Za-km-z]{32,44})\b')
+CA_REGEX = re.compile(r’\b([1-9A-HJ-NP-Za-km-z]{32,44})\b’)
 
 EXCLUDE_WORDS = {
-    'PFM', 'TIP', 'OKX', 'MAE', 'BAN', 'BNK', 'PDR', 'BLO', 'STB',
-    'TRO', 'TRT', 'GMG', 'PHO', 'AXI', 'EXP', 'TW',
-    'NEW', 'live', 'meme', 'docs', 'guide', 'matches'
+‘PFM’, ‘TIP’, ‘NEW’, ‘OKX’, ‘MAE’, ‘BAN’, ‘BNK’, ‘PDR’, ‘BLO’, ‘STB’,
+‘TRO’, ‘TRT’, ‘GMG’, ‘PHO’, ‘AXI’, ‘EXP’, ‘TW’, ‘DEX’, ‘DEF’, ‘DP’,
+‘SOC’, ‘SOL’, ‘PVP’, ‘FDV’, ‘USD’, ‘CTO’, ‘KOL’, ‘PASS’, ‘FILTER’,
 }
 
-DEXSCREENER_URL = 'https://api.dexscreener.com/latest/dex/tokens/{ca}'
-RUGCHECK_URL = 'https://api.rugcheck.xyz/v1/tokens/{ca}/report/summary'
+def extract_ca(text):
+if not text:
+return None
+matches = CA_REGEX.findall(text)
+if not matches:
+return None
+candidates = [
+m for m in matches
+if 32 <= len(m) <= 44
+and m.upper() not in EXCLUDE_WORDS
+and not m.isdigit()
+]
+if not candidates:
+return None
+pump_candidates = [c for c in candidates if c.endswith(‘pump’)]
+if pump_candidates:
+return max(pump_candidates, key=len)
+return max(candidates, key=len)
 
+async def fetch_rugcheck(client, ca):
+try:
+url = ‘https://api.rugcheck.xyz/v1/tokens/’ + ca + ‘/report’
+resp = await client.get(url, timeout=3.0)
+if resp.status_code != 200:
+return {‘available’: False}
+data = resp.json()
+score = data.get(‘score_normalised’) or data.get(‘score’) or 0
+risks = data.get(‘risks’, [])
+risk_names = [r.get(‘name’, ‘’) for r in risks if r.get(‘level’) in (‘warn’, ‘danger’)]
+lp_locked = 0
+markets = data.get(‘markets’, [])
+if markets and markets[0].get(‘lp’):
+lp_locked = markets[0][‘lp’].get(‘lpLockedPct’, 0)
+if score >= 70:
+level = ‘SAFE’
+elif score >= 40:
+level = ‘WARNING’
+else:
+level = ‘DANGER’
+return {
+‘available’: True,
+‘score’: int(score),
+‘level’: level,
+‘risks’: risk_names[:3],
+‘lp_locked’: int(lp_locked),
+}
+except Exception as e:
+log.warning(’RugCheck error: ’ + str(e))
+return {‘available’: False}
 
-@app.route('/health', methods=['GET', 'HEAD'])
-def health():
-    return jsonify({'status': 'ok', 'version': '2.3'}), 200
+async def fetch_dexscreener(client, ca):
+try:
+url = ‘https://api.dexscreener.com/latest/dex/tokens/’ + ca
+resp = await client.get(url, timeout=3.0)
+if resp.status_code != 200:
+return {‘available’: False}
+data = resp.json()
+pairs = data.get(‘pairs’) or []
+if not pairs:
+return {‘available’: False}
+pair = max(pairs, key=lambda p: (p.get(‘liquidity’) or {}).get(‘usd’, 0))
+vol_5m = (pair.get(‘volume’) or {}).get(‘m5’, 0)
+vol_1h = (pair.get(‘volume’) or {}).get(‘h1’, 0)
+avg_5m = vol_1h / 12 if vol_1h else 0
+accel = (vol_5m / avg_5m) if avg_5m > 0 else 0
+txns_5m = (pair.get(‘txns’) or {}).get(‘m5’, {})
+buys_5m = txns_5m.get(‘buys’, 0)
+sells_5m = txns_5m.get(‘sells’, 0)
+bs_ratio = (buys_5m / sells_5m) if sells_5m > 0 else 0
+price_change_5m = (pair.get(‘priceChange’) or {}).get(‘m5’, 0)
+price_change_1h = (pair.get(‘priceChange’) or {}).get(‘h1’, 0)
+liquidity_usd = (pair.get(‘liquidity’) or {}).get(‘usd’, 0)
+return {
+‘available’: True,
+‘vol_5m’: int(vol_5m),
+‘vol_1h’: int(vol_1h),
+‘accel’: round(accel, 2),
+‘buys_5m’: buys_5m,
+‘sells_5m’: sells_5m,
+‘bs_ratio’: round(bs_ratio, 2),
+‘price_change_5m’: round(price_change_5m, 1),
+‘price_change_1h’: round(price_change_1h, 1),
+‘liquidity_usd’: int(liquidity_usd),
+‘txns_5m_total’: buys_5m + sells_5m,
+}
+except Exception as e:
+log.warning(’DexScreener error: ’ + str(e))
+return {‘available’: False}
 
+def build_enrichment_text(rug, dex):
+if rug.get(‘available’):
+rug_level = rug[‘level’]
+rug_score = rug[‘score’]
+rug_flags = ’, ’.join(rug[‘risks’]) if rug[‘risks’] else ‘NONE’
+lp_locked = rug[‘lp_locked’]
+else:
+rug_level = ‘UNKNOWN’
+rug_score = 0
+rug_flags = ‘N/A’
+lp_locked = 100
 
-@app.route('/enrich', methods=['POST'])
-def enrich():
-    try:
-        data = request.get_json()
-        if not data or 'message' not in data:
-            return jsonify({'error': 'no message'}), 400
-        
-        message = data['message']
-        ca = extract_ca(message)
-        
-        if not ca:
-            return format_response(empty_data(), source='no_ca')
-        
-        logger.info('Processing CA: ' + ca)
-        
-        rugcheck = fetch_rugcheck(ca)
-        dexscreener = fetch_dexscreener(ca)
-        
-        return format_response({
-            **rugcheck,
-            **dexscreener
-        }, source='full')
-        
-    except Exception as e:
-        logger.error('Error: ' + str(e))
-        return format_response(empty_data(), source='error')
+```
+if dex.get('available'):
+    dex_status = 'OK'
+    vol_5m = dex['vol_5m']
+    vol_1h = dex['vol_1h']
+    accel = dex['accel']
+    bs_ratio = dex['bs_ratio']
+    buys_5m = dex['buys_5m']
+    sells_5m = dex['sells_5m']
+    price_5m = dex['price_change_5m']
+    price_1h = dex['price_change_1h']
+    liquidity_usd = dex['liquidity_usd']
+    txns_5m_total = dex['txns_5m_total']
+else:
+    dex_status = 'UNAVAILABLE'
+    vol_5m = 0
+    vol_1h = 0
+    accel = 0
+    bs_ratio = 0
+    buys_5m = 0
+    sells_5m = 0
+    price_5m = 0
+    price_1h = 0
+    liquidity_usd = 0
+    txns_5m_total = 0
 
+lines = [
+    '',
+    '=== ON-CHAIN ===',
+    'RUG_LEVEL: ' + str(rug_level),
+    'RUG_SCORE: ' + str(rug_score),
+    'RUG_FLAGS: ' + str(rug_flags),
+    'LP_LOCKED: ' + str(lp_locked),
+    'DEX_STATUS: ' + str(dex_status),
+    'VOL_5M: ' + str(vol_5m),
+    'VOL_1H: ' + str(vol_1h),
+    'VOL_ACCEL: ' + str(accel),
+    'BS_ONCHAIN: ' + str(bs_ratio),
+    'BUYS_5M: ' + str(buys_5m),
+    'SELLS_5M: ' + str(sells_5m),
+    'PRICE_5M: ' + str(price_5m),
+    'PRICE_1H: ' + str(price_1h),
+    'LIQUIDITY_USD: ' + str(liquidity_usd),
+    'TXNS_5M_TOTAL: ' + str(txns_5m_total),
+    '===============',
+]
+return '\n'.join(lines)
+```
 
-def extract_ca(message):
-    matches = SOLANA_CA_PATTERN.findall(message)
-    candidates = [m for m in matches if m not in EXCLUDE_WORDS]
-    
-    if not candidates:
-        return None
-    
-    pump_tokens = [c for c in candidates if c.endswith('pump')]
-    if pump_tokens:
-        return pump_tokens[0]
-    
-    return candidates[0]
+@app.post(’/enrich’)
+async def enrich(request: Request):
+try:
+body = await request.json()
+except Exception:
+return JSONResponse({‘error’: ‘invalid_json’, ‘enrichment’: ‘’}, status_code=400)
 
+```
+message_text = body.get('message', '') or body.get('text', '')
+ca = extract_ca(message_text)
 
-def fetch_rugcheck(ca):
-    try:
-        r = requests.get(RUGCHECK_URL.format(ca=ca), timeout=8)
-        if r.status_code != 200:
-            return rugcheck_fallback()
-        
-        d = r.json()
-        score = d.get('score', 0)
-        
-        if score < 5:
-            risk_level = 'SAFE'
-        elif score < 20:
-            risk_level = 'WARNING'
-        else:
-            risk_level = 'DANGER'
-        
-        risks = d.get('risks', [])
-        if any(x.get('level') == 'danger' for x in risks):
-            risk_level = 'DANGER'
-        elif any(x.get('level') == 'warn' for x in risks) and risk_level == 'SAFE':
-            risk_level = 'WARNING'
-        
-        flags = []
-        for risk in risks:
-            name = risk.get('name', '')
-            if name and name not in flags:
-                flags.append(name)
-        
-        lp_locked = d.get('totalLPProviders', 0)
-        markets = d.get('markets', [])
-        if markets:
-            for m in markets:
-                lp = m.get('lp', {})
-                lp_pct = lp.get('lpLockedPct', 0)
-                if lp_pct > 0:
-                    lp_locked = lp_pct
-                    break
-        
-        return {
-            'rug_level': risk_level,
-            'rug_score': int(score),
-            'rug_flags': ', '.join(flags) if flags else 'NONE',
-            'lp_locked': int(lp_locked) if lp_locked else 100
-        }
-    except Exception:
-        return rugcheck_fallback()
-
-
-def fetch_dexscreener(ca):
-    try:
-        r = requests.get(DEXSCREENER_URL.format(ca=ca), timeout=8)
-        if r.status_code != 200:
-            return dexscreener_fallback()
-        
-        d = r.json()
-        pairs = d.get('pairs', [])
-        
-        if not pairs:
-            return {**dexscreener_fallback(), 'dex_status': 'UNAVAILABLE'}
-        
-        pair = max(pairs, key=lambda p: p.get('liquidity', {}).get('usd', 0))
-        
-        vol_5m = pair.get('volume', {}).get('m5', 0)
-        vol_1h = pair.get('volume', {}).get('h1', 0)
-        vol_accel = (vol_5m * 12) / vol_1h if vol_1h > 0 else 0
-        if vol_accel > 12:
-            vol_accel = 12
-        
-        txns = pair.get('txns', {}).get('m5', {})
-        buys = txns.get('buys', 0)
-        sells = txns.get('sells', 0)
-        bs_onchain = buys / sells if sells > 0 else (buys if buys > 0 else 0)
-        
-        price_5m = pair.get('priceChange', {}).get('m5', 0)
-        price_1h = pair.get('priceChange', {}).get('h1', 0)
-        liquidity_usd = pair.get('liquidity', {}).get('usd', 0)
-        
-        return {
-            'dex_status': 'OK',
-            'vol_5m': int(vol_5m),
-            'vol_1h': int(vol_1h),
-            'vol_accel': round(vol_accel, 2),
-            'bs_onchain': round(bs_onchain, 2),
-            'buys_5m': buys,
-            'sells_5m': sells,
-            'price_5m': round(price_5m, 1),
-            'liquidity_usd': int(liquidity_usd),
-            'price_1h': round(price_1h, 1),
-            'txns_5m_total': buys + sells
-        }
-    except Exception:
-        return dexscreener_fallback()
-
-
-def rugcheck_fallback():
+if not ca:
     return {
-        'rug_level': 'UNKNOWN',
-        'rug_score': 0,
-        'rug_flags': 'NONE',
-        'lp_locked': 100
+        'enrichment': '\n=== ON-CHAIN ===\nRUG_LEVEL: UNKNOWN\nRUG_SCORE: 0\nRUG_FLAGS: N/A\nLP_LOCKED: 100\nDEX_STATUS: UNAVAILABLE\nVOL_5M: 0\nVOL_1H: 0\nVOL_ACCEL: 0\nBS_ONCHAIN: 0\nBUYS_5M: 0\nSELLS_5M: 0\nPRICE_5M: 0\nPRICE_1H: 0\nLIQUIDITY_USD: 0\nTXNS_5M_TOTAL: 0\n===============',
     }
 
+log.info('Processing CA: ' + ca)
 
-def dexscreener_fallback():
-    return {
-        'dex_status': 'UNAVAILABLE',
-        'vol_5m': 0,
-        'vol_1h': 0,
-        'vol_accel': 0,
-        'bs_onchain': 0,
-        'buys_5m': 0,
-        'sells_5m': 0,
-        'price_5m': 0,
-        'liquidity_usd': 0,
-        'price_1h': 0,
-        'txns_5m_total': 0
-    }
+async with httpx.AsyncClient() as client:
+    results = await asyncio.gather(
+        fetch_rugcheck(client, ca),
+        fetch_dexscreener(client, ca),
+        return_exceptions=True
+    )
+rug = results[0] if isinstance(results[0], dict) else {'available': False}
+dex = results[1] if isinstance(results[1], dict) else {'available': False}
 
+enrichment_text = build_enrichment_text(rug, dex)
 
-def empty_data():
-    return {**rugcheck_fallback(), **dexscreener_fallback()}
+return {
+    'enrichment': enrichment_text,
+    'ca': ca,
+    'rug_score': rug.get('score') if rug.get('available') else None,
+    'rug_level': rug.get('level') if rug.get('available') else None,
+    'vol_accel': dex.get('accel') if dex.get('available') else None,
+}
+```
 
+@app.get(’/’)
+async def root():
+return {‘service’: ‘SMART ENTRY Webhook’, ‘status’: ‘ok’, ‘version’: ‘2.3’}
 
-def format_response(data, source='full'):
-    text = '=== ON-CHAIN ===\n'
-    text += 'RUG_LEVEL: ' + str(data['rug_level']) + '\n'
-    text += 'RUG_SCORE: ' + str(data['rug_score']) + '\n'
-    text += 'RUG_FLAGS: ' + str(data['rug_flags']) + '\n'
-    text += 'LP_LOCKED: ' + str(data['lp_locked']) + '\n'
-    text += 'DEX_STATUS: ' + str(data['dex_status']) + '\n'
-    text += 'VOL_5M: ' + str(data['vol_5m']) + '\n'
-    text += 'VOL_1H: ' + str(data['vol_1h']) + '\n'
-    text += 'VOL_ACCEL: ' + str(data['vol_accel']) + '\n'
-    text += 'BS_ONCHAIN: ' + str(data['bs_onchain']) + '\n'
-    text += 'BUYS_5M: ' + str(data['buys_5m']) + '\n'
-    text += 'SELLS_5M: ' + str(data['sells_5m']) + '\n'
-    text += 'PRICE_5M: ' + str(data['price_5m']) + '\n'
-    text += 'LIQUIDITY_USD: ' + str(data['liquidity_usd']) + '\n'
-    text += 'PRICE_1H: ' + str(data['price_1h']) + '\n'
-    text += 'TXNS_5M_TOTAL: ' + str(data['txns_5m_total']) + '\n'
-    text += '==============='
-    
-    return jsonify({'response': text, 'source': source}), 200
-
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+@app.get(’/health’)
+async def health():
+return {‘status’: ‘healthy’, ‘version’: ‘2.3’}
