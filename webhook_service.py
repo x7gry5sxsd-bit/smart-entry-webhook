@@ -1,8 +1,6 @@
-# Webhook Service v2.3 - Smart Entry MEMS
+# Webhook Service v2.2 - Smart Entry MEMS
 
-# Author: Uspex
-
-# Version 2.3 - added LIQUIDITY_USD, PRICE_1H, TXNS_5M_TOTAL
+# ASCII-clean version - no Smart Punctuation issues
 
 # Deployed on Render Free Tier
 
@@ -12,8 +10,12 @@
 
 import re
 import os
+import logging
 from flask import Flask, request, jsonify
 import requests
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(‘webhook_service’)
 
 app = Flask(**name**)
 
@@ -34,12 +36,10 @@ RUGCHECK_URL = ‘https://api.rugcheck.xyz/v1/tokens/{ca}/report/summary’
 
 @app.route(’/health’, methods=[‘GET’, ‘HEAD’])
 def health():
-# Health check for cron-job.org keepalive
-return jsonify({‘status’: ‘ok’, ‘version’: ‘2.3’}), 200
+return jsonify({‘status’: ‘ok’, ‘version’: ‘2.2’}), 200
 
 @app.route(’/enrich’, methods=[‘POST’])
 def enrich():
-# Main endpoint - signal enrichment
 try:
 data = request.get_json()
 if not data or ‘message’ not in data:
@@ -52,6 +52,8 @@ return jsonify({‘error’: ‘no message’}), 400
     if not ca:
         return format_response(empty_data(), source='no_ca')
     
+    logger.info('Processing CA: ' + ca)
+    
     rugcheck = fetch_rugcheck(ca)
     dexscreener = fetch_dexscreener(ca)
     
@@ -61,12 +63,11 @@ return jsonify({‘error’: ‘no message’}), 400
     }, source='full')
     
 except Exception as e:
+    logger.error('Error: ' + str(e))
     return format_response(empty_data(), source='error: ' + str(e))
 ```
 
 def extract_ca(message):
-# Extract Contract Address from message
-# Priority: pump tokens (suffix ‘pump’), then any Solana CA
 matches = SOLANA_CA_PATTERN.findall(message)
 
 ```
@@ -80,12 +81,10 @@ pump_tokens = [c for c in candidates if c.endswith('pump')]
 if pump_tokens:
     return pump_tokens[0]
 
-# Otherwise first found
 return candidates[0]
 ```
 
 def fetch_rugcheck(ca):
-# RugCheck API - SAFE/WARNING/DANGER + flags + LP_LOCKED
 try:
 r = requests.get(RUGCHECK_URL.format(ca=ca), timeout=8)
 if r.status_code != 200:
@@ -94,7 +93,6 @@ return rugcheck_fallback()
 ```
     d = r.json()
     
-    # Risk level
     score = d.get('score', 0)
     if score < 5:
         risk_level = 'SAFE'
@@ -103,21 +101,18 @@ return rugcheck_fallback()
     else:
         risk_level = 'DANGER'
     
-    # Override: high level risks force DANGER
     risks = d.get('risks', [])
     if any(r.get('level') == 'danger' for r in risks):
         risk_level = 'DANGER'
     elif any(r.get('level') == 'warn' for r in risks) and risk_level == 'SAFE':
         risk_level = 'WARNING'
     
-    # Flags
     flags = []
     for risk in risks:
         name = risk.get('name', '')
         if name and name not in flags:
             flags.append(name)
     
-    # LP locked
     lp_locked = d.get('totalLPProviders', 0)
     markets = d.get('markets', [])
     if markets:
@@ -140,7 +135,6 @@ except Exception:
 ```
 
 def fetch_dexscreener(ca):
-# DexScreener API - all DEX metrics + NEW v2.3 fields
 try:
 r = requests.get(DEXSCREENER_URL.format(ca=ca), timeout=8)
 if r.status_code != 200:
@@ -153,7 +147,6 @@ return dexscreener_fallback()
     if not pairs:
         return {**dexscreener_fallback(), 'dex_status': 'UNAVAILABLE'}
     
-    # Take pair with highest liquidity (most active pool)
     pair = max(pairs, key=lambda p: p.get('liquidity', {}).get('usd', 0))
     
     vol_5m = pair.get('volume', {}).get('m5', 0)
@@ -168,11 +161,6 @@ return dexscreener_fallback()
     bs_onchain = buys / sells if sells > 0 else (buys if buys > 0 else 0)
     
     price_5m = pair.get('priceChange', {}).get('m5', 0)
-    price_1h = pair.get('priceChange', {}).get('h1', 0)
-    
-    # NEW v2.3 fields
-    liquidity_usd = pair.get('liquidity', {}).get('usd', 0)
-    txns_5m_total = buys + sells
     
     return {
         'dex_status': 'OK',
@@ -182,10 +170,7 @@ return dexscreener_fallback()
         'bs_onchain': round(bs_onchain, 2),
         'buys_5m': buys,
         'sells_5m': sells,
-        'price_5m': round(price_5m, 1),
-        'liquidity_usd': int(liquidity_usd),
-        'price_1h': round(price_1h, 1),
-        'txns_5m_total': txns_5m_total
+        'price_5m': round(price_5m, 1)
     }
 
 except Exception:
@@ -193,7 +178,6 @@ except Exception:
 ```
 
 def rugcheck_fallback():
-# Neutral fallback - do not block signal
 return {
 ‘rug_level’: ‘UNKNOWN’,
 ‘rug_score’: 0,
@@ -202,7 +186,6 @@ return {
 }
 
 def dexscreener_fallback():
-# Neutral fallback
 return {
 ‘dex_status’: ‘UNAVAILABLE’,
 ‘vol_5m’: 0,
@@ -211,10 +194,7 @@ return {
 ‘bs_onchain’: 0,
 ‘buys_5m’: 0,
 ‘sells_5m’: 0,
-‘price_5m’: 0,
-‘liquidity_usd’: 0,
-‘price_1h’: 0,
-‘txns_5m_total’: 0
+‘price_5m’: 0
 }
 
 def empty_data():
@@ -224,7 +204,6 @@ return {
 }
 
 def format_response(data, source=‘full’):
-# Format response for FlowIn substitution
 response_text = ‘=== ON-CHAIN ===\n’
 response_text += ’RUG_LEVEL: ’ + str(data[‘rug_level’]) + ‘\n’
 response_text += ’RUG_SCORE: ’ + str(data[‘rug_score’]) + ‘\n’
@@ -238,9 +217,6 @@ response_text += ’BS_ONCHAIN: ’ + str(data[‘bs_onchain’]) + ‘\n’
 response_text += ’BUYS_5M: ’ + str(data[‘buys_5m’]) + ‘\n’
 response_text += ’SELLS_5M: ’ + str(data[‘sells_5m’]) + ‘\n’
 response_text += ’PRICE_5M: ’ + str(data[‘price_5m’]) + ‘\n’
-response_text += ’LIQUIDITY_USD: ’ + str(data[‘liquidity_usd’]) + ‘\n’
-response_text += ’PRICE_1H: ’ + str(data[‘price_1h’]) + ‘\n’
-response_text += ’TXNS_5M_TOTAL: ’ + str(data[‘txns_5m_total’]) + ‘\n’
 response_text += ‘===============’
 
 ```
