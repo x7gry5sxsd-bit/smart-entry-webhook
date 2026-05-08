@@ -1,6 +1,7 @@
 import re
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -9,7 +10,7 @@ import httpx
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-app = FastAPI(title='SMART ENTRY Webhook')
+app = FastAPI(title='SMART ENTRY Webhook v2.7')
 
 CA_REGEX = re.compile(r'\b([1-9A-HJ-NP-Za-km-z]{32,44})\b')
 
@@ -25,6 +26,9 @@ STOPWORDS = {
     'of', 'in', 'to', 'is', 'by', 'on', 'at', 'as', 'so', 'be', 'was',
     'are', 'an', 'or', 'it',
 }
+
+# v2.7: Topic Radar URL (override via env if needed)
+RADAR_URL = os.getenv('RADAR_URL', 'https://topic-radar.onrender.com')
 
 
 def extract_ca(text):
@@ -301,6 +305,34 @@ async def fetch_wikipedia_views(client, keyword):
         return {'available': False}
 
 
+# ===== v2.7: Topic Radar =====
+async def fetch_radar_match(client, token_name):
+    """Calls Topic Radar /match endpoint with token name."""
+    if not token_name:
+        return {'available': False}
+    try:
+        url = RADAR_URL + '/match'
+        params = {'name': token_name}
+        resp = await client.get(url, params=params, timeout=4.0)
+        if resp.status_code != 200:
+            return {'available': False}
+        data = resp.json()
+        matches = data.get('matches') or []
+        first_match = matches[0] if matches else {}
+        return {
+            'available': True,
+            'best_keyword': data.get('best_keyword') or 'NONE',
+            'best_score': int(data.get('best_score', 0) or 0),
+            'best_match_type': data.get('best_match_type') or 'NONE',
+            'match_count': int(data.get('match_count', 0) or 0),
+            'top_match_age_h': float(first_match.get('age_hours', 0) or 0),
+            'top_match_strength': float(first_match.get('match_strength', 0) or 0),
+        }
+    except Exception as e:
+        log.warning('Radar error: ' + str(e))
+        return {'available': False}
+
+
 def calculate_topic_hot_score(reddit, gdelt, wiki):
     score = 0
     if reddit.get('available'):
@@ -360,7 +392,7 @@ def get_time_metrics():
     }
 
 
-def build_enrichment_text(rug, dex, pump, time_data, topic):
+def build_enrichment_text(rug, dex, pump, time_data, topic, radar):
     if rug.get('available'):
         rug_level = rug['level']
         rug_score = rug['score']
@@ -420,6 +452,22 @@ def build_enrichment_text(rug, dex, pump, time_data, topic):
     wiki_views = wiki_data.get('views_today', 0) if wiki_data.get('available') else 0
     wiki_spike = wiki_data.get('spike_ratio', 0) if wiki_data.get('available') else 0
     has_wiki = wiki_data.get('has_wiki', 0) if wiki_data.get('available') else 0
+
+    if radar.get('available'):
+        radar_match = radar.get('best_keyword', 'NONE') or 'NONE'
+        radar_score = radar.get('best_score', 0)
+        radar_match_type = radar.get('best_match_type', 'NONE') or 'NONE'
+        radar_match_count = radar.get('match_count', 0)
+        radar_age_h = radar.get('top_match_age_h', 0.0)
+        radar_strength = radar.get('top_match_strength', 0.0)
+    else:
+        radar_match = 'UNAVAILABLE'
+        radar_score = 0
+        radar_match_type = 'NONE'
+        radar_match_count = 0
+        radar_age_h = 0.0
+        radar_strength = 0.0
+
     lines = [
         '',
         '=== ON-CHAIN ===',
@@ -465,6 +513,12 @@ def build_enrichment_text(rug, dex, pump, time_data, topic):
         'HAS_WIKIPEDIA: ' + str(has_wiki),
         'WIKI_VIEWS_TODAY: ' + str(wiki_views),
         'WIKI_SPIKE_RATIO: ' + str(wiki_spike),
+        'RADAR_MATCH: ' + str(radar_match),
+        'RADAR_SCORE: ' + str(radar_score),
+        'RADAR_MATCH_TYPE: ' + str(radar_match_type),
+        'RADAR_MATCH_COUNT: ' + str(radar_match_count),
+        'RADAR_TOPIC_AGE_H: ' + str(radar_age_h),
+        'RADAR_MATCH_STRENGTH: ' + str(radar_strength),
         '===============',
     ]
     return '\n'.join(lines)
@@ -484,9 +538,10 @@ async def enrich(request: Request):
     log.info('Token: ' + str(token_name) + ' | keyword: ' + str(keyword))
     if not ca:
         topic_empty = {'keyword': keyword or 'NONE', 'hot_score': 0, 'reddit': {}, 'gdelt': {}, 'wiki': {}}
+        radar_empty = {'available': False}
         return {'enrichment': build_enrichment_text(
             {'available': False}, {'available': False}, {'available': False},
-            time_data, topic_empty)}
+            time_data, topic_empty, radar_empty)}
     log.info('Processing CA: ' + ca)
     async with httpx.AsyncClient() as client:
         tasks = [
@@ -498,19 +553,31 @@ async def enrich(request: Request):
             tasks.append(fetch_reddit_hotness(client, keyword))
             tasks.append(fetch_gdelt_news(client, keyword))
             tasks.append(fetch_wikipedia_views(client, keyword))
+        if token_name:
+            tasks.append(fetch_radar_match(client, token_name))
         results = await asyncio.gather(*tasks, return_exceptions=True)
     rug = results[0] if isinstance(results[0], dict) else {'available': False}
     dex = results[1] if isinstance(results[1], dict) else {'available': False}
     pump = results[2] if isinstance(results[2], dict) else {'available': False}
-    if keyword and len(results) >= 6:
-        reddit = results[3] if isinstance(results[3], dict) else {'available': False}
-        gdelt = results[4] if isinstance(results[4], dict) else {'available': False}
-        wiki = results[5] if isinstance(results[5], dict) else {'available': False}
+
+    idx = 3
+    if keyword:
+        reddit = results[idx] if idx < len(results) and isinstance(results[idx], dict) else {'available': False}
+        idx += 1
+        gdelt = results[idx] if idx < len(results) and isinstance(results[idx], dict) else {'available': False}
+        idx += 1
+        wiki = results[idx] if idx < len(results) and isinstance(results[idx], dict) else {'available': False}
+        idx += 1
     else:
         reddit = gdelt = wiki = {'available': False}
+    if token_name:
+        radar = results[idx] if idx < len(results) and isinstance(results[idx], dict) else {'available': False}
+    else:
+        radar = {'available': False}
+
     hot_score = calculate_topic_hot_score(reddit, gdelt, wiki)
     topic = {'keyword': keyword or 'NONE', 'hot_score': hot_score, 'reddit': reddit, 'gdelt': gdelt, 'wiki': wiki}
-    enrichment_text = build_enrichment_text(rug, dex, pump, time_data, topic)
+    enrichment_text = build_enrichment_text(rug, dex, pump, time_data, topic, radar)
     return {
         'enrichment': enrichment_text,
         'ca': ca,
@@ -521,14 +588,16 @@ async def enrich(request: Request):
         'rug_level': rug.get('level') if rug.get('available') else None,
         'vol_accel': dex.get('accel') if dex.get('available') else None,
         'reply_count': pump.get('reply_count') if pump.get('available') else None,
+        'radar_match': radar.get('best_keyword') if radar.get('available') else None,
+        'radar_score': radar.get('best_score') if radar.get('available') else None,
     }
 
 
 @app.get('/')
 async def root():
-    return {'service': 'SMART ENTRY Webhook', 'status': 'ok', 'version': '2.6'}
+    return {'service': 'SMART ENTRY Webhook', 'status': 'ok', 'version': '2.7'}
 
 
 @app.get('/health')
 async def health():
-    return {'status': 'healthy', 'version': '2.6'}
+    return {'status': 'healthy', 'version': '2.7'}
