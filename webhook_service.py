@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 log = logging.getLogger(__name__)
 
-app = FastAPI(title='SMART ENTRY Webhook v2.9')
+app = FastAPI(title='SMART ENTRY Webhook v3.0')
 
 CA_REGEX = re.compile(r'[1-9A-HJ-NP-Za-km-z]{32,44}')
 EXCLUDE_WORDS = {'NEW', 'PUMP', 'BOND', 'BURN', 'COIN', 'TOKEN', 'SCAM', 'RUG'}
@@ -251,7 +251,7 @@ async def fetch_reddit_hotness(client, keyword):
     try:
         url = 'https://www.reddit.com/search.json'
         params = {'q': keyword, 'sort': 'hot', 'limit': 25, 't': 'day'}
-        headers = {'User-Agent': 'SmartEntry/2.9'}
+        headers = {'User-Agent': 'SmartEntry/3.0'}
         resp = await client.get(url, params=params, headers=headers, timeout=4.0)
         if resp.status_code != 200:
             return {'available': False}
@@ -293,8 +293,6 @@ async def fetch_gdelt_news(client, keyword):
     except Exception as e:
         log.warning('GDELT error for ' + str(keyword) + ': ' + str(e))
         return {'available': False}
-
-
 async def fetch_wikipedia_views(client, keyword):
     try:
         title = keyword.title().replace(' ', '_')
@@ -331,15 +329,18 @@ async def fetch_wikipedia_views(client, keyword):
 
 
 async def fetch_radar_match(client, token_name):
+    """v3.0: FIXED — был баг с параметром (token_name vs name) и структурой ответа."""
     try:
         url = RADAR_URL + '/match'
-        params = {'token_name': token_name}
+        params = {'name': token_name}  # v3.0 FIX: name (не token_name!)
         resp = await client.get(url, params=params, timeout=4.0)
         if resp.status_code != 200:
+            log.warning('Radar HTTP ' + str(resp.status_code) + ' for ' + str(token_name))
             return {'available': False}
         data = resp.json()
-        match = data.get('match')
-        if not match or not match.get('keyword'):
+        # v3.0 FIX: Topic Radar v0.3 возвращает best_keyword/best_score напрямую
+        best_keyword = data.get('best_keyword')
+        if not best_keyword:
             return {
                 'available': True,
                 'matched': False,
@@ -350,15 +351,20 @@ async def fetch_radar_match(client, token_name):
                 'topic_age_h': 0.0,
                 'strength': 0.0,
             }
+        # Берём первый матч из списка для age и strength
+        matches = data.get('matches', [])
+        first_match = matches[0] if matches else {}
+        log.info('Radar MATCH for "' + str(token_name) + '" -> "' + str(best_keyword) +
+                 '" score=' + str(data.get('best_score', 0)))
         return {
             'available': True,
             'matched': True,
-            'keyword': match.get('keyword', 'NONE'),
-            'score': match.get('score', 0),
-            'match_type': match.get('match_type', 'NONE'),
-            'match_count': match.get('match_count', 1),
-            'topic_age_h': round(match.get('topic_age_h', 0.0), 1),
-            'strength': round(match.get('strength', 0.0), 2),
+            'keyword': best_keyword,
+            'score': data.get('best_score', 0),
+            'match_type': data.get('best_match_type', 'NONE'),
+            'match_count': data.get('match_count', 1),
+            'topic_age_h': round(first_match.get('age_hours', 0.0), 1),
+            'strength': round(first_match.get('match_strength', 0.0), 2),
         }
     except Exception as e:
         log.warning('Radar error: ' + str(e))
@@ -455,8 +461,6 @@ def compute_derived_metrics(dex_data):
     out['bs_delta'] = round(out['bs_5m'] - out['bs_1h'], 2)
 
     return out
-
-
 def build_enrichment_text(rug, dex, pump, time_data, topic, radar):
     # v2.9: derived metrics
     derived = compute_derived_metrics(dex)
@@ -580,7 +584,7 @@ def build_enrichment_text(rug, dex, pump, time_data, topic, radar):
         'HAS_WIKIPEDIA: ' + str(has_wiki),
         'WIKI_VIEWS_TODAY: ' + str(wiki_views),
         'WIKI_SPIKE_RATIO: ' + str(wiki_spike),
-        # v2.7: Radar block
+        # v2.7: Radar block (v3.0 FIXED!)
         'RADAR_MATCH: ' + str(radar_match),
         'RADAR_SCORE: ' + str(radar_score),
         'RADAR_MATCH_TYPE: ' + str(radar_match_type),
@@ -603,12 +607,12 @@ def build_enrichment_text(rug, dex, pump, time_data, topic, radar):
 
 @app.get('/')
 async def root():
-    return {'service': 'SMART ENTRY Webhook v2.9', 'status': 'ok', 'version': '2.9'}
+    return {'service': 'SMART ENTRY Webhook v3.0', 'status': 'ok', 'version': '3.0'}
 
 
 @app.get('/health')
 async def health():
-    return {'status': 'healthy', 'version': '2.9'}
+    return {'status': 'healthy', 'version': '3.0'}
 
 
 @app.post('/enrich')
