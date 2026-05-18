@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 log = logging.getLogger(__name__)
 
-app = FastAPI(title='SMART ENTRY Webhook v3.0')
+app = FastAPI(title='SMART ENTRY Webhook v3.1')
 
 CA_REGEX = re.compile(r'[1-9A-HJ-NP-Za-km-z]{32,44}')
 EXCLUDE_WORDS = {'NEW', 'PUMP', 'BOND', 'BURN', 'COIN', 'TOKEN', 'SCAM', 'RUG'}
@@ -23,7 +23,6 @@ STOPWORDS = {
     'cure', 'meme', 'coin', 'token', 'sol', 'bonk', 'dog', 'cat',
     'of', 'in', 'to', 'is', 'by', 'on', 'at', 'as', 'so', 'be', 'was',
     'are', 'an', 'or', 'it',
-    # v2.8: generic words that always win on Reddit but mean nothing specific
     'agent', 'show', 'horse', 'number', 'world', 'time', 'life',
     'new', 'old', 'good', 'bad', 'big', 'small', 'best', 'top',
     'season', 'episode', 'movie', 'film', 'video', 'photo',
@@ -37,7 +36,6 @@ STOPWORDS = {
     'ai', 'app', 'web', 'dev',
 }
 
-# v2.7: Topic Radar URL (override via env if needed)
 RADAR_URL = os.getenv('RADAR_URL', 'https://topic-radar.onrender.com')
 
 
@@ -72,7 +70,6 @@ def extract_token_name(text):
 
 
 def extract_keyword_candidates(token_name):
-    """v2.8: Returns up to 3 candidate keywords sorted by likely specificity."""
     if not token_name:
         return []
     name = token_name.strip().lower()
@@ -101,7 +98,6 @@ def extract_keyword(token_name):
 
 
 async def pick_best_keyword(client, candidates):
-    """v2.8: Run Reddit search for each candidate, pick the one with highest top_score."""
     if not candidates:
         return None, {'available': False}
     if len(candidates) == 1:
@@ -251,7 +247,7 @@ async def fetch_reddit_hotness(client, keyword):
     try:
         url = 'https://www.reddit.com/search.json'
         params = {'q': keyword, 'sort': 'hot', 'limit': 25, 't': 'day'}
-        headers = {'User-Agent': 'SmartEntry/3.0'}
+        headers = {'User-Agent': 'SmartEntry/3.1'}
         resp = await client.get(url, params=params, headers=headers, timeout=4.0)
         if resp.status_code != 200:
             return {'available': False}
@@ -293,6 +289,8 @@ async def fetch_gdelt_news(client, keyword):
     except Exception as e:
         log.warning('GDELT error for ' + str(keyword) + ': ' + str(e))
         return {'available': False}
+
+
 async def fetch_wikipedia_views(client, keyword):
     try:
         title = keyword.title().replace(' ', '_')
@@ -329,16 +327,15 @@ async def fetch_wikipedia_views(client, keyword):
 
 
 async def fetch_radar_match(client, token_name):
-    """v3.0: FIXED — был баг с параметром (token_name vs name) и структурой ответа."""
+    """v3.1: FIXED + NEW RADAR_SOURCES (источник тренда)"""
     try:
         url = RADAR_URL + '/match'
-        params = {'name': token_name}  # v3.0 FIX: name (не token_name!)
+        params = {'name': token_name}
         resp = await client.get(url, params=params, timeout=4.0)
         if resp.status_code != 200:
             log.warning('Radar HTTP ' + str(resp.status_code) + ' for ' + str(token_name))
             return {'available': False}
         data = resp.json()
-        # v3.0 FIX: Topic Radar v0.3 возвращает best_keyword/best_score напрямую
         best_keyword = data.get('best_keyword')
         if not best_keyword:
             return {
@@ -350,12 +347,25 @@ async def fetch_radar_match(client, token_name):
                 'match_count': 0,
                 'topic_age_h': 0.0,
                 'strength': 0.0,
+                'sources': 'NONE',
             }
-        # Берём первый матч из списка для age и strength
         matches = data.get('matches', [])
         first_match = matches[0] if matches else {}
+        
+        # v3.1: собираем sources из всех matches
+        sources_set = set()
+        for m in matches:
+            src_list = m.get('sources', [])
+            if isinstance(src_list, list):
+                for s in src_list:
+                    sources_set.add(str(s))
+            elif src_list:
+                sources_set.add(str(src_list))
+        sources_str = ','.join(sorted(sources_set)) if sources_set else 'NONE'
+        
         log.info('Radar MATCH for "' + str(token_name) + '" -> "' + str(best_keyword) +
-                 '" score=' + str(data.get('best_score', 0)))
+                 '" score=' + str(data.get('best_score', 0)) + 
+                 ' sources=[' + sources_str + ']')
         return {
             'available': True,
             'matched': True,
@@ -365,6 +375,7 @@ async def fetch_radar_match(client, token_name):
             'match_count': data.get('match_count', 1),
             'topic_age_h': round(first_match.get('age_hours', 0.0), 1),
             'strength': round(first_match.get('match_strength', 0.0), 2),
+            'sources': sources_str,
         }
     except Exception as e:
         log.warning('Radar error: ' + str(e))
@@ -404,7 +415,6 @@ def calculate_topic_hot_score(reddit, gdelt, wiki):
 
 
 def compute_derived_metrics(dex_data):
-    """v2.9: Compute derived metrics from DexScreener on-chain data."""
     out = {
         'price_accel': 0,
         'vol_accel_24h': 0,
@@ -431,17 +441,14 @@ def compute_derived_metrics(dex_data):
     price_5m = dex_data.get('price_change_5m', 0)
     price_1h = dex_data.get('price_change_1h', 0)
 
-    # PRICE_ACCEL: price_5m vs price_5m-equivalent of last hour
     if price_1h and price_1h != 0:
         out['price_accel'] = round(price_5m / (price_1h / 12), 2)
 
-    # VOL_ACCEL_24h: vol_5m vs avg 5m over last 24h
     if vol_24h and vol_24h > 0:
         avg_5m_24h = vol_24h / 288.0
         if avg_5m_24h > 0:
             out['vol_accel_24h'] = round(vol_5m / avg_5m_24h, 2)
 
-    # AVG_TX_5M, AVG_TX_1H, TX_SIZE_DELTA
     if txns_5m > 0:
         out['avg_tx_5m'] = round(vol_5m / txns_5m, 1)
     if txns_1h > 0:
@@ -449,7 +456,6 @@ def compute_derived_metrics(dex_data):
     if out['avg_tx_1h'] > 0:
         out['tx_size_delta'] = round(out['avg_tx_5m'] / out['avg_tx_1h'], 2)
 
-    # BS metrics
     if sells_5m > 0:
         out['bs_5m'] = round(buys_5m / sells_5m, 2)
     elif buys_5m > 0:
@@ -461,8 +467,9 @@ def compute_derived_metrics(dex_data):
     out['bs_delta'] = round(out['bs_5m'] - out['bs_1h'], 2)
 
     return out
+
+
 def build_enrichment_text(rug, dex, pump, time_data, topic, radar):
-    # v2.9: derived metrics
     derived = compute_derived_metrics(dex)
     if rug.get('available'):
         rug_level = rug['level']
@@ -531,6 +538,7 @@ def build_enrichment_text(rug, dex, pump, time_data, topic, radar):
         radar_match_count = radar.get('match_count', 0)
         radar_age_h = radar.get('topic_age_h', 0.0)
         radar_strength = radar.get('strength', 0.0)
+        radar_sources = radar.get('sources', 'NONE') or 'NONE'
     else:
         radar_match = 'NONE'
         radar_score = 0
@@ -538,6 +546,7 @@ def build_enrichment_text(rug, dex, pump, time_data, topic, radar):
         radar_match_count = 0
         radar_age_h = 0.0
         radar_strength = 0.0
+        radar_sources = 'NONE'
 
     lines = [
         '',
@@ -584,14 +593,13 @@ def build_enrichment_text(rug, dex, pump, time_data, topic, radar):
         'HAS_WIKIPEDIA: ' + str(has_wiki),
         'WIKI_VIEWS_TODAY: ' + str(wiki_views),
         'WIKI_SPIKE_RATIO: ' + str(wiki_spike),
-        # v2.7: Radar block (v3.0 FIXED!)
         'RADAR_MATCH: ' + str(radar_match),
         'RADAR_SCORE: ' + str(radar_score),
         'RADAR_MATCH_TYPE: ' + str(radar_match_type),
         'RADAR_MATCH_COUNT: ' + str(radar_match_count),
         'RADAR_TOPIC_AGE_H: ' + str(radar_age_h),
         'RADAR_MATCH_STRENGTH: ' + str(radar_strength),
-        # v2.9: DERIVED metrics block
+        'RADAR_SOURCES: ' + str(radar_sources),
         'PRICE_ACCEL: ' + str(derived['price_accel']),
         'VOL_ACCEL_24H: ' + str(derived['vol_accel_24h']),
         'AVG_TX_5M: ' + str(derived['avg_tx_5m']),
@@ -607,12 +615,12 @@ def build_enrichment_text(rug, dex, pump, time_data, topic, radar):
 
 @app.get('/')
 async def root():
-    return {'service': 'SMART ENTRY Webhook v3.0', 'status': 'ok', 'version': '3.0'}
+    return {'service': 'SMART ENTRY Webhook v3.1', 'status': 'ok', 'version': '3.1'}
 
 
 @app.get('/health')
 async def health():
-    return {'status': 'healthy', 'version': '3.0'}
+    return {'status': 'healthy', 'version': '3.1'}
 
 
 @app.post('/enrich')
@@ -646,7 +654,6 @@ async def enrich(request: Request):
         if keyword:
             tasks.append(fetch_gdelt_news(client, keyword))
             tasks.append(fetch_wikipedia_views(client, keyword))
-        # v2.7: Radar always called when token_name available
         if token_name:
             tasks.append(fetch_radar_match(client, token_name))
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -654,7 +661,6 @@ async def enrich(request: Request):
     dex = results[1] if isinstance(results[1], dict) else {'available': False}
     pump = results[2] if isinstance(results[2], dict) else {'available': False}
 
-    # v2.8: parse remaining results — reddit already obtained
     idx = 3
     if keyword:
         gdelt = results[idx] if idx < len(results) and isinstance(results[idx], dict) else {'available': False}
